@@ -22,6 +22,9 @@ npm.cmd run build
 ## Features
 
 - Create, edit, save, archive, restore, and permanently delete notes.
+- Favorites (star a note), Recently Viewed (last 10 opened notes), and per-note Version History with restore.
+- Checklists: lines written as `- [ ] item` / `- [x] item` show as tickable checkboxes with progress.
+- Six font themes (Sans, Serif, Mono, Rounded, Slab, Hyperlegible) and three text sizes; settings sync to your account.
 - Search titles, content, and tags; filter notes using the tag sidebar.
 - Light, dark, and system color themes; sans-serif, serif, and monospace fonts.
 - Responsive desktop, tablet, and mobile layouts.
@@ -33,7 +36,7 @@ npm.cmd run build
 
 1. Create a Supabase project and copy `.env.example` to `.env.local`.
 2. Set `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` to the project URL and public anon/publishable key. Never put a service-role key in frontend environment variables.
-3. Run [`supabase-schema.sql`](./supabase-schema.sql) in the Supabase SQL Editor to create the notes table and per-user row-level security policies.
+3. Run [`supabase-schema.sql`](./supabase-schema.sql) in the Supabase SQL Editor to create the `notes`, `note_versions`, and `user_preferences` tables with per-user row-level security policies. It is safe to re-run.
 4. Enable email/password sign-in under **Authentication → Providers → Email**. Under **Authentication → URL Configuration**, set the Site URL and add `http://127.0.0.1:5173` (and your deployed URL) to the redirect URLs so confirmation and password-reset links work.
    - Optional: enable **Google** under **Authentication → Providers** for the “Log in with Google” button.
 5. Restart the Vite server. Users can then sign up or sign in; each account reads and writes only its own notes.

@@ -1,26 +1,45 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import {
-  Archive, ArrowLeft, ChevronRight, CircleCheck, Clock3, FileText,
-  Home, Info, Lock, LogOut, Monitor, Moon, Plus, RotateCcw, Search, Settings,
-  Sun, Tag, Trash2, Type, X,
+  ALargeSmall, Archive, ArrowLeft, ChevronRight, CircleCheck, Clock3, FileText, History,
+  Home, Info, ListChecks, Lock, LogOut, Monitor, Moon, Plus, RotateCcw, Search, Settings,
+  SquareCheck, Star, Sun, Tag, Trash2, Type, X,
 } from 'lucide-react';
 import {
-  formatDate, loadNotes, loadPreferences, parseTags, saveNotes, savePreferences,
+  RECENT_LIMIT, formatDate, getChecklist, loadNotes, loadPreferences, loadVersions, parseTags,
+  saveNotes, savePreferences, saveVersions, toggleChecklistLine, trimVersions,
 } from './model';
-import type { Note, Preferences } from './model';
+import type { FontSize, FontTheme, Note, NoteVersion, Preferences } from './model';
 import type { Session } from '@supabase/supabase-js';
 import AuthScreen, { MIN_PASSWORD_LENGTH } from './components/AuthScreen';
 import Brand from './components/Brand';
 import PasswordField from './components/PasswordField';
-import { fetchUserNotes, saveUserNotes, supabase, supabaseConfigured } from './lib/supabase';
+import HistoryDialog from './components/HistoryDialog';
+import {
+  fetchNoteVersions, fetchUserNotes, fetchUserPreferences, insertNoteVersion, saveUserNotes,
+  saveUserPreferences, supabase, supabaseConfigured,
+} from './lib/supabase';
 
-type View = 'all' | 'archive' | 'tag' | 'settings' | 'tags';
+type View = 'all' | 'favorites' | 'recent' | 'archive' | 'tag' | 'settings' | 'tags';
 type Draft = Omit<Note, 'tags'> & { tags: string };
 type ModalState = { kind: 'archive' | 'delete' | 'discard'; run: () => void };
 type SettingsTab = 'theme' | 'font' | 'password' | 'about';
 type PasswordForm = { current: string; next: string; confirm: string };
 type ToastState = { message: string; destination?: 'archive' | 'all' };
+
+const fontOptions: { value: FontTheme; label: string; description: string }[] = [
+  { value: 'sans', label: 'Sans-serif', description: 'Clean and modern, easy to read.' },
+  { value: 'serif', label: 'Serif', description: 'Classic and elegant for a timeless feel.' },
+  { value: 'mono', label: 'Monospace', description: 'Code-like, great for a technical vibe.' },
+  { value: 'rounded', label: 'Rounded', description: 'Soft and friendly letterforms.' },
+  { value: 'slab', label: 'Slab Serif', description: 'Bold, sturdy serifs with a typewriter feel.' },
+  { value: 'legible', label: 'Hyperlegible', description: 'Designed for maximum readability.' },
+];
+const fontSizeOptions: { value: FontSize; label: string; description: string }[] = [
+  { value: 'small', label: 'Small', description: 'Fit more of your note on screen.' },
+  { value: 'medium', label: 'Medium', description: 'The default, balanced size.' },
+  { value: 'large', label: 'Large', description: 'Bigger text that is easier on the eyes.' },
+];
 
 function toDraft(note: Note | undefined): Draft | null {
   return note ? { ...note, tags: note.tags.join(', ') } : null;
@@ -65,9 +84,28 @@ function Confirmation({ modal, close }: { modal: ModalState; close: () => void }
   </div>;
 }
 
+function ChecklistProgress({ content }: { content: string }) {
+  const items = getChecklist(content);
+  if (!items.length) return null;
+  return <span className="note-card-progress"><SquareCheck size={12} aria-hidden="true" />{items.filter(item => item.checked).length}/{items.length}</span>;
+}
+
+function Checklist({ content, onToggle }: { content: string; onToggle: (line: number) => void }) {
+  const items = getChecklist(content);
+  if (!items.length) return null;
+  const done = items.filter(item => item.checked).length;
+  return <section className="checklist-panel" aria-label="Checklist">
+    <div className="checklist-header"><ListChecks size={16} aria-hidden="true" /><span>Checklist</span><span className="checklist-count">{done}/{items.length} done</span></div>
+    <div className="checklist-progress" aria-hidden="true"><span style={{ width: `${(done / items.length) * 100}%` }} /></div>
+    <ul>{items.map(item => <li key={item.line}><label className={item.checked ? 'is-checked' : undefined}><input type="checkbox" checked={item.checked} onChange={() => onToggle(item.line)} /><span>{item.text || 'Untitled item'}</span></label></li>)}</ul>
+  </section>;
+}
+
 export default function App() {
   const [notes, setNotes] = useState(loadNotes);
   const [preferences, setPreferences] = useState(loadPreferences);
+  const [versions, setVersions] = useState(loadVersions);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [view, setView] = useState<View>('all');
   const [activeTag, setActiveTag] = useState('');
   const [query, setQuery] = useState('');
@@ -92,6 +130,7 @@ export default function App() {
   const [passwordErrors, setPasswordErrors] = useState<Partial<Record<keyof PasswordForm, string>>>({});
   const [passwordBusy, setPasswordBusy] = useState(false);
   const titleRef = useRef<HTMLTextAreaElement>(null);
+  const bodyRef = useRef<HTMLTextAreaElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
   const savedNote = draft ? notes.find(note => note.id === draft.id) : undefined;
@@ -103,11 +142,15 @@ export default function App() {
   const normalizedQuery = query.trim().toLocaleLowerCase();
 
   function getVisibleNotes(source: Note[] = notes, currentView = view, currentTag = activeTag, currentQuery = normalizedQuery) {
-    return source.filter(note => {
+    const matches = source.filter(note => {
       if (currentView === 'archive' ? !note.archived : note.archived) return false;
       if (currentView === 'tag' && !note.tags.includes(currentTag)) return false;
+      if (currentView === 'favorites' && !note.favorite) return false;
+      if (currentView === 'recent' && !note.lastOpenedAt) return false;
       return !currentQuery || `${note.title} ${note.content} ${note.tags.join(' ')}`.toLocaleLowerCase().includes(currentQuery);
-    }).sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+    });
+    if (currentView === 'recent') return matches.sort((a, b) => Date.parse(b.lastOpenedAt) - Date.parse(a.lastOpenedAt)).slice(0, RECENT_LIMIT);
+    return matches.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
   }
 
   const filteredNotes = getVisibleNotes();
@@ -155,6 +198,14 @@ export default function App() {
       setNotes(userNotes);
       setDraft(toDraft(userNotes.find(note => !note.archived)));
       saveNotes(userNotes);
+      return fetchUserPreferences(session.user.id).then(cloudPreferences => {
+        if (!active || !cloudPreferences) return;
+        setPreferences(cloudPreferences);
+        setPendingPreferences(cloudPreferences);
+        savePreferences(cloudPreferences);
+      }).catch(() => {
+        // Preferences fall back to this browser's copy when the cloud copy can't be read.
+      });
     }).catch(error => {
       if (active) setCloudLoadError(error instanceof Error ? error.message : 'Could not load your cloud notes.');
     }).finally(() => {
@@ -169,6 +220,7 @@ export default function App() {
       const dark = preferences.theme === 'dark' || (preferences.theme === 'system' && media.matches);
       document.documentElement.dataset.theme = dark ? 'dark' : 'light';
       document.documentElement.dataset.font = preferences.font;
+      document.documentElement.dataset.fontSize = preferences.fontSize;
       document.querySelector('meta[name="theme-color"]')?.setAttribute('content', dark ? '#0e121b' : '#ffffff');
     };
     apply();
@@ -220,6 +272,8 @@ export default function App() {
     return persisted;
   }
 
+  const closeHistory = useCallback(() => setHistoryOpen(false), []);
+
   function signOut() {
     guard(() => {
       if (!supabase) return;
@@ -257,7 +311,73 @@ export default function App() {
 
   function selectNote(note: Note) {
     if (draft?.id === note.id) { setMobileView('editor'); return; }
-    guard(() => { setDraft(toDraft(note)); setValidationError(''); setMobileView('editor'); });
+    guard(() => {
+      const opened = { ...note, lastOpenedAt: new Date().toISOString() };
+      commitNotes(notes.map(item => item.id === note.id ? opened : item));
+      setDraft(toDraft(opened)); setValidationError(''); setMobileView('editor');
+    });
+  }
+
+  function toggleFavorite() {
+    if (!savedNote) return;
+    const favorite = !savedNote.favorite;
+    commitNotes(notes.map(item => item.id === savedNote.id ? { ...item, favorite } : item));
+    if (draft) setDraft({ ...draft, favorite });
+    setToast({ message: favorite ? 'Added to Favorites.' : 'Removed from Favorites.' });
+  }
+
+  function recordVersion(previous: Note) {
+    const version: NoteVersion = { id: crypto.randomUUID(), noteId: previous.id, title: previous.title, tags: [...previous.tags], content: previous.content, savedAt: previous.updatedAt };
+    if (session && supabaseConfigured) {
+      void insertNoteVersion(session.user.id, version).catch(error => {
+        setCloudError(error instanceof Error ? error.message : 'Could not save version history.');
+      });
+      return;
+    }
+    const next = trimVersions([version, ...versions]);
+    setVersions(next);
+    saveVersions(next);
+  }
+
+  const loadHistory = useCallback(async () => {
+    const noteId = draft?.id || '';
+    if (session && supabaseConfigured) return fetchNoteVersions(session.user.id, noteId);
+    return versions.filter(version => version.noteId === noteId).sort((a, b) => Date.parse(b.savedAt) - Date.parse(a.savedAt));
+  }, [draft?.id, session, versions]);
+
+  function restoreVersion(version: NoteVersion) {
+    if (!draft) return;
+    setDraft({ ...draft, title: version.title, tags: version.tags.join(', '), content: version.content });
+    setValidationError('');
+    setToast({ message: 'Version loaded. Save the note to keep it.' });
+  }
+
+  function toggleChecklistItem(line: number) {
+    if (!draft) return;
+    const content = toggleChecklistLine(draft.content, line);
+    // A saved note with no other edits is saved right away so ticking items feels instant.
+    if (savedNote && !dirty) {
+      const note: Note = { ...savedNote, content, updatedAt: new Date().toISOString() };
+      commitNotes(notes.map(item => item.id === note.id ? note : item));
+      setDraft(toDraft(note));
+    } else {
+      setDraft({ ...draft, content });
+    }
+  }
+
+  function insertChecklistItem() {
+    if (!draft) return;
+    const element = bodyRef.current;
+    const position = element ? element.selectionStart : draft.content.length;
+    const before = draft.content.slice(0, position);
+    const prefix = before && !before.endsWith('\n') ? '\n- [ ] ' : '- [ ] ';
+    const content = before + prefix + draft.content.slice(position);
+    setDraft({ ...draft, content });
+    window.setTimeout(() => {
+      if (!element) return;
+      element.focus();
+      element.selectionStart = element.selectionEnd = position + prefix.length;
+    }, 0);
   }
 
   function navigate(nextView: View, tag = '') {
@@ -280,7 +400,7 @@ export default function App() {
   function createNote() {
     guard(() => {
       setView('all'); setQuery(''); setActiveTag('');
-      setDraft({ id: crypto.randomUUID(), title: '', tags: '', content: '', updatedAt: '', archived: false });
+      setDraft({ id: crypto.randomUUID(), title: '', tags: '', content: '', updatedAt: '', archived: false, favorite: false, lastOpenedAt: '' });
       setMobileView('editor'); setValidationError('');
       window.setTimeout(() => titleRef.current?.focus(), 0);
     });
@@ -306,7 +426,9 @@ export default function App() {
       titleRef.current?.focus();
       return;
     }
-    const note: Note = { ...draft, title: draft.title.trim(), tags: parseTags(draft.tags), updatedAt: new Date().toISOString() };
+    const now = new Date().toISOString();
+    const note: Note = { ...draft, ...(savedNote && { favorite: savedNote.favorite, archived: savedNote.archived }), title: draft.title.trim(), tags: parseTags(draft.tags), lastOpenedAt: now, updatedAt: now };
+    if (savedNote && (savedNote.title !== note.title || savedNote.content !== note.content || savedNote.tags.join(', ') !== note.tags.join(', '))) recordVersion(savedNote);
     const persisted = commitNotes([note, ...notes.filter(item => item.id !== note.id)]);
     setDraft(toDraft(note)); setValidationError('');
     setToast({ message: persisted ? 'Note saved successfully!' : 'Note updated in this tab. Browser storage is unavailable.' });
@@ -352,6 +474,11 @@ export default function App() {
     guard(() => setModal({ kind: 'delete', run: () => {
       const updated = notes.filter(item => item.id !== note.id);
       commitNotes(updated);
+      if (versions.some(version => version.noteId === note.id)) {
+        const remaining = versions.filter(version => version.noteId !== note.id);
+        setVersions(remaining);
+        saveVersions(remaining);
+      }
       const next = getVisibleNotes(updated, view, activeTag, query.trim().toLocaleLowerCase()).find(item => item.id !== note.id) || getVisibleNotes(updated, view, activeTag, query.trim().toLocaleLowerCase())[0];
       setDraft(toDraft(next));
       setMobileView('list');
@@ -363,16 +490,26 @@ export default function App() {
     setPreferences(pendingPreferences);
     const persisted = savePreferences(pendingPreferences);
     setPreferencesStorageError(!persisted);
-    setToast({ message: persisted ? 'Settings updated successfully!' : 'Settings applied for this session.' });
+    if (session && supabaseConfigured) {
+      void saveUserPreferences(session.user.id, pendingPreferences).catch(error => {
+        setCloudError(error instanceof Error ? error.message : 'Could not sync your settings.');
+      });
+    }
+    setToast({ message: persisted || session ? 'Settings updated successfully!' : 'Settings applied for this session.' });
   }
 
   const settingsLabels: Record<SettingsTab, string> = { theme: 'Color Theme', font: 'Font Theme', password: 'Change Password', about: 'About Notes' };
   const settingsIcons: Record<SettingsTab, ReactNode> = { theme: <Sun size={20} />, font: <Type size={20} />, password: <Lock size={20} />, about: <Info size={20} /> };
-  const title = view === 'settings' ? 'Settings' : view === 'archive' ? 'Archived Notes' : view === 'tags' ? 'Tags' : query ? 'Search' : view === 'tag' ? `Notes Tagged: ${activeTag}` : 'All Notes';
+  const title = view === 'settings' ? 'Settings' : view === 'favorites' ? 'Favorites' : view === 'recent' ? 'Recently Viewed' : view === 'archive' ? 'Archived Notes' : view === 'tags' ? 'Tags' : query ? 'Search' : view === 'tag' ? `Notes Tagged: ${activeTag}` : 'All Notes';
   const showNotes = view !== 'settings' && view !== 'tags';
 
   function tagNavigation(mobile = false) {
     return <div className={mobile ? 'mobile-tags-panel' : 'tag-navigation'}>
+      {mobile && <>
+        <button className="nav-item" onClick={() => navigate('favorites')}><Star size={20} aria-hidden="true" /><span>Favorites</span></button>
+        <button className="nav-item" onClick={() => navigate('recent')}><Clock3 size={20} aria-hidden="true" /><span>Recently Viewed</span></button>
+        <p className="tags-heading mobile-tags-heading">Tags</p>
+      </>}
       {tags.map(tag => <button key={tag} className={`nav-item${view === 'tag' && activeTag === tag ? ' is-active' : ''}`} aria-label={`Open notes tagged ${tag}`} onClick={() => navigate('tag', tag)}>
         <Tag size={20} aria-hidden="true" /><span>{tag}</span>{view === 'tag' && activeTag === tag && <ChevronRight size={18} className="nav-chevron" />}
       </button>)}
@@ -410,6 +547,8 @@ export default function App() {
       <Brand />
       <nav className="sidebar-navigation">
         <button className={`nav-item${view === 'all' ? ' is-active' : ''}`} aria-label="Open all notes" onClick={() => navigate('all')}><Home size={20} /><span>All Notes</span>{view === 'all' && <ChevronRight size={18} className="nav-chevron" />}</button>
+        <button className={`nav-item${view === 'favorites' ? ' is-active' : ''}`} aria-label="Open favorite notes" onClick={() => navigate('favorites')}><Star size={20} /><span>Favorites</span>{view === 'favorites' && <ChevronRight size={18} className="nav-chevron" />}</button>
+        <button className={`nav-item${view === 'recent' ? ' is-active' : ''}`} aria-label="Open recently viewed notes" onClick={() => navigate('recent')}><Clock3 size={20} /><span>Recent</span>{view === 'recent' && <ChevronRight size={18} className="nav-chevron" />}</button>
         <button className={`nav-item${view === 'archive' ? ' is-active' : ''}`} aria-label="Open archived notes" onClick={() => navigate('archive')}><Archive size={20} /><span>Archived Notes</span>{view === 'archive' && <ChevronRight size={18} className="nav-chevron" />}</button>
       </nav>
       <div className="sidebar-divider" />
@@ -433,17 +572,19 @@ export default function App() {
       <section className="notes-panel" aria-label="Notes list">
         <button className="button button-primary button-create" onClick={createNote}><Plus size={20} />Create New Note</button>
         {view === 'archive' && <p className="search-description">All your archived notes are stored here. You can restore or delete them anytime.</p>}
+        {view === 'favorites' && !query && <p className="search-description">Notes you’ve starred. Use the star on any note to add it here.</p>}
+        {view === 'recent' && !query && <p className="search-description">The last {RECENT_LIMIT} notes you opened, newest first.</p>}
         {view === 'tag' && <p className="search-description">All notes with the <strong>{activeTag}</strong> tag are shown here.</p>}
         {query && <p className="search-description">{filteredNotes.length} {filteredNotes.length === 1 ? 'result' : 'results'} for “{query}”</p>}
         <div className="notes-scroll">
           {isNew && draft && <button className="note-card is-selected" onClick={() => setMobileView('editor')}><span className="note-card-title">{draft.title || 'Untitled Note'}</span><span className="note-card-date">Not yet saved</span></button>}
           {filteredNotes.map(note => <button key={note.id} className={`note-card${draft?.id === note.id ? ' is-selected' : ''}`} onClick={() => selectNote(note)} aria-current={draft?.id === note.id ? 'true' : undefined}>
-            <span className="note-card-title">{note.title}</span>
+            <span className="note-card-title">{note.favorite && <Star className="note-card-star" size={14} aria-label="Favorite" />}{note.title}</span>
             <span className="note-card-tags">{note.tags.map(tag => <span className="tag-chip" key={tag}>{tag}</span>)}</span>
-            <span className="note-card-date">{formatDate(note.updatedAt)}</span>
+            <span className="note-card-date">{formatDate(view === 'recent' ? note.lastOpenedAt : note.updatedAt)}<ChecklistProgress content={note.content} /></span>
           </button>)}
           {!filteredNotes.length && !isNew && <div className="list-empty"><FileText className="list-empty-icon" size={28} />
-            <p>{query ? 'No notes found. Try a different search.' : view === 'archive' ? 'No archived notes yet.' : view === 'tag' ? 'No notes with this tag.' : 'You don’t have any notes yet. Start a new note to capture your thoughts and ideas.'}</p>
+            <p>{query ? 'No notes found. Try a different search.' : view === 'archive' ? 'No archived notes yet.' : view === 'favorites' ? 'No favorites yet. Star a note to pin it here.' : view === 'recent' ? 'Notes you open will show up here.' : view === 'tag' ? 'No notes with this tag.' : 'You don’t have any notes yet. Start a new note to capture your thoughts and ideas.'}</p>
           </div>}
         </div>
       </section>
@@ -453,7 +594,7 @@ export default function App() {
           <div className="editor-mobile-toolbar">
             <button type="button" className="toolbar-back" onClick={cancelEdit}><ArrowLeft size={18} />Go Back</button>
             <div className="toolbar-actions">
-              {savedNote && <><button type="button" aria-label="Delete note" onClick={requestDelete}><Trash2 size={20} /></button><button type="button" aria-label={savedNote.archived ? 'Restore note' : 'Archive note'} onClick={savedNote.archived ? restoreNote : requestArchive}>{savedNote.archived ? <RotateCcw size={20} /> : <Archive size={20} />}</button></>}
+              {savedNote && <><button type="button" aria-label={savedNote.favorite ? 'Remove from favorites' : 'Add to favorites'} aria-pressed={savedNote.favorite} className={savedNote.favorite ? 'is-favorite' : undefined} onClick={toggleFavorite}><Star size={20} /></button><button type="button" aria-label="Version history" onClick={() => setHistoryOpen(true)}><History size={20} /></button><button type="button" aria-label="Delete note" onClick={requestDelete}><Trash2 size={20} /></button><button type="button" aria-label={savedNote.archived ? 'Restore note' : 'Archive note'} onClick={savedNote.archived ? restoreNote : requestArchive}>{savedNote.archived ? <RotateCcw size={20} /> : <Archive size={20} />}</button></>}
               <button type="button" onClick={cancelEdit}>Cancel</button><button type="submit" className="toolbar-save mobile-save">Save Note</button>
             </div>
           </div>
@@ -466,14 +607,16 @@ export default function App() {
             {draft.archived && <div className="meta-row"><span className="meta-label"><Archive size={16} />Status</span><span className="meta-value">Archived</span></div>}
           </div>
           <div className="editor-divider" />
+          <Checklist content={draft.content} onToggle={toggleChecklistItem} />
+          <div className="editor-toolbar"><button type="button" className="editor-tool" onClick={insertChecklistItem}><SquareCheck size={16} />Add checklist item</button></div>
           <label className="sr-only" htmlFor="note-content">Note content</label>
-          <textarea className="note-body" id="note-content" placeholder="Start typing your note here..." value={draft.content} onChange={event => setDraft({ ...draft, content: event.target.value })} spellCheck="false" />
+          <textarea ref={bodyRef} className="note-body" id="note-content" placeholder="Start typing your note here..." value={draft.content} onChange={event => setDraft({ ...draft, content: event.target.value })} spellCheck="false" />
           <div className="editor-footer"><button className="button button-primary" type="submit">Save Note</button><button className="button button-secondary" type="button" onClick={cancelEdit}>Cancel</button>{dirty && <span className="unsaved-indicator">Unsaved changes</span>}</div>
         </form> : <div className="empty-editor"><FileText size={40} /><h2>{query ? 'Find your next idea' : 'A place for your thoughts'}</h2><p>{query ? 'Select a result to read or edit your note.' : 'Select a note to get started, or create something new.'}</p><button className="button button-primary" onClick={createNote}><Plus size={18} />Create New Note</button></div>}
       </main>
 
       <aside className="actions-panel" aria-label="Note actions">
-        {savedNote && <div className="actions-stack"><button className="button button-outline action-button" onClick={savedNote.archived ? restoreNote : requestArchive}>{savedNote.archived ? <RotateCcw size={20} /> : <Archive size={20} />}{savedNote.archived ? 'Restore Note' : 'Archive Note'}</button><button className="button button-outline action-button" onClick={requestDelete}><Trash2 size={20} />Delete Note</button></div>}
+        {savedNote && <div className="actions-stack"><button className={`button button-outline action-button${savedNote.favorite ? ' is-favorite' : ''}`} aria-pressed={savedNote.favorite} onClick={toggleFavorite}><Star size={20} />{savedNote.favorite ? 'Remove Favorite' : 'Add to Favorites'}</button><button className="button button-outline action-button" onClick={() => setHistoryOpen(true)}><History size={20} />Version History</button><button className="button button-outline action-button" onClick={savedNote.archived ? restoreNote : requestArchive}>{savedNote.archived ? <RotateCcw size={20} /> : <Archive size={20} />}{savedNote.archived ? 'Restore Note' : 'Archive Note'}</button><button className="button button-outline action-button" onClick={requestDelete}><Trash2 size={20} />Delete Note</button></div>}
       </aside>
     </>}
 
@@ -492,11 +635,16 @@ export default function App() {
           {settingOption('dark', pendingPreferences.theme, <Moon size={24} />, 'Dark Mode', 'Select a sleek and modern dark theme.', theme => setPendingPreferences({ ...pendingPreferences, theme }))}
           {settingOption('system', pendingPreferences.theme, <Monitor size={24} />, 'System', 'Adapts to your device’s theme.', theme => setPendingPreferences({ ...pendingPreferences, theme }))}
         </div>}
-        {settingsTab === 'font' && <div className="setting-options" role="radiogroup" aria-label="Font theme">
-          {settingOption('sans', pendingPreferences.font, <span className="font-preview font-sans">Aa</span>, 'Sans-serif', 'Clean and modern, easy to read.', font => setPendingPreferences({ ...pendingPreferences, font }))}
-          {settingOption('serif', pendingPreferences.font, <span className="font-preview font-serif">Aa</span>, 'Serif', 'Classic and elegant for a timeless feel.', font => setPendingPreferences({ ...pendingPreferences, font }))}
-          {settingOption('mono', pendingPreferences.font, <span className="font-preview font-mono">Aa</span>, 'Monospace', 'Code-like, great for a technical vibe.', font => setPendingPreferences({ ...pendingPreferences, font }))}
-        </div>}
+        {settingsTab === 'font' && <>
+          <div className="setting-options" role="radiogroup" aria-label="Font theme">
+            {fontOptions.map(option => settingOption(option.value, pendingPreferences.font, <span className={`font-preview font-${option.value}`}>Aa</span>, option.label, option.description, font => setPendingPreferences({ ...pendingPreferences, font })))}
+          </div>
+          <h3 className="settings-subheading">Text Size</h3>
+          <p className="settings-description">Choose the size of your note text:</p>
+          <div className="setting-options" role="radiogroup" aria-label="Text size">
+            {fontSizeOptions.map(option => settingOption(option.value, pendingPreferences.fontSize, <ALargeSmall size={24} className={`size-preview size-${option.value}`} />, option.label, option.description, fontSize => setPendingPreferences({ ...pendingPreferences, fontSize })))}
+          </div>
+        </>}
         {settingsTab === 'password' && <form className="password-form" onSubmit={changePassword} noValidate>
           <PasswordField id="old-password" label="Old Password" value={passwordForm.current} onChange={current => setPasswordForm({ ...passwordForm, current })} autoComplete="current-password" error={passwordErrors.current} />
           <PasswordField id="new-password" label="New Password" value={passwordForm.next} onChange={next => setPasswordForm({ ...passwordForm, next })} autoComplete="new-password" hint={`At least ${MIN_PASSWORD_LENGTH} characters`} error={passwordErrors.next} />
@@ -510,6 +658,7 @@ export default function App() {
     <nav className="mobile-nav" aria-label="Main navigation">
       <button className={`mobile-nav-item${view === 'all' ? ' is-active' : ''}`} onClick={() => navigate('all')}><Home size={22} /><span>Home</span></button>
       <button className={`mobile-nav-item${query ? ' is-active' : ''}`} onClick={() => { if (view === 'settings' || view === 'tags') navigate('all'); setMobileView('list'); window.setTimeout(() => searchRef.current?.focus(), 0); }}><Search size={22} /><span>Search</span></button>
+      <button className={`mobile-nav-item${view === 'favorites' ? ' is-active' : ''}`} onClick={() => navigate('favorites')}><Star size={22} /><span>Favorites</span></button>
       <button className={`mobile-nav-item${view === 'archive' ? ' is-active' : ''}`} onClick={() => navigate('archive')}><Archive size={22} /><span>Archived</span></button>
       <button className={`mobile-nav-item${view === 'tag' || view === 'tags' ? ' is-active' : ''}`} onClick={() => navigate('tags')}><Tag size={22} /><span>Tags</span></button>
       <button className={`mobile-nav-item${view === 'settings' ? ' is-active' : ''}`} onClick={() => navigate('settings')}><Settings size={22} /><span>Settings</span></button>
@@ -518,6 +667,7 @@ export default function App() {
     {(notesStorageError || preferencesStorageError) && <div className="storage-warning" role="alert">{notesStorageError ? 'Your browser couldn’t save your notes. Keep this tab open to preserve them.' : 'Your browser couldn’t save your settings. They may reset when you reload.'}</div>}
     {cloudError && <div className="storage-warning cloud-warning" role="alert">Cloud sync issue: {cloudError}</div>}
     {modal && <Confirmation modal={modal} close={() => setModal(null)} />}
+    {historyOpen && savedNote && <HistoryDialog noteTitle={savedNote.title} loadVersions={loadHistory} onRestore={restoreVersion} close={closeHistory} />}
     {toast && !modal && <div className="toast" role="status"><CircleCheck className="toast-icon" size={20} /><span className="toast-message">{toast.message}</span>{toast.destination && <button className="toast-action" aria-label={`View ${toast.destination === 'archive' ? 'archived notes' : 'all notes'} list`} onClick={() => { navigate(toast.destination!); setToast(null); }}>View {toast.destination === 'archive' ? 'Archived Notes' : 'All Notes'}</button>}<button className="toast-close" aria-label="Dismiss notification" onClick={() => setToast(null)}><X size={18} /></button></div>}
     <span className="sr-only" aria-live="polite">{dirty ? 'You have unsaved changes.' : ''}</span>
   </div>;

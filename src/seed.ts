@@ -1,6 +1,6 @@
 import type { Note } from './model';
 
-export const seedNotes: Note[] = [
+export const seedNotes: Omit<Note, 'favorite' | 'lastOpenedAt'>[] = [
   {
     id: 'react-performance',
     title: 'React Performance Optimization',
@@ -43,9 +43,9 @@ Kyoto
 - Book a traditional tea ceremony
 
 Before departure
-- Reserve accommodation and train tickets
-- Check passport and travel documents
-- Pack comfortable walking shoes`,
+- [x] Reserve accommodation and train tickets
+- [ ] Check passport and travel documents
+- [ ] Pack comfortable walking shoes`,
   },
   {
     id: 'pasta-recipes',
